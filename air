@@ -1,0 +1,422 @@
+import os
+import json
+import time
+import math
+import base64
+import urllib.request
+from collections import deque
+from datetime import datetime
+import cv2
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import requests
+
+# --- Directory and Path Configuration ---
+CONFIG_DIR = "config"
+CONFIG_PATH = os.path.join(CONFIG_DIR, "brush_palette.json")
+SKETCH_DIR = os.path.join("canvas", "sketches")
+MODEL_PATH = "hand_landmarker.task"
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+
+DEFAULT_CONFIG = {
+    "brush_colors": [
+        {"name": "Blue", "bgr": [255, 0, 0]},
+        {"name": "Green", "bgr": [0, 255, 0]},
+        {"name": "Red", "bgr": [0, 0, 255]},
+        {"name": "Yellow", "bgr": [0, 255, 255]},
+        {"name": "Eraser", "bgr": [0, 0, 0]}
+    ],
+    "default_brush_size": 6,
+    "eraser_size": 45,
+    "ollama_url": "http://localhost:11434/api/generate",
+    "ollama_model": "llava"
+}
+
+
+def download_model_if_missing():
+    """Downloads hand_landmarker.task model automatically if not present."""
+    if not os.path.exists(MODEL_PATH):
+        print("Downloading MediaPipe Hand Landmarker model file (~8.8MB)...")
+        try:
+            urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+            print("Model downloaded successfully!")
+        except Exception as e:
+            print(f"Error downloading model file: {e}")
+
+
+def load_config():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(SKETCH_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "w") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=2)
+        except Exception:
+            pass
+        return DEFAULT_CONFIG
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return DEFAULT_CONFIG
+
+
+CONFIG = load_config()
+
+
+# --- Exponential Smoother for Point Tracking ---
+class PointSmoother:
+    def __init__(self, alpha=0.35):
+        self.alpha = alpha
+        self.smooth_x = None
+        self.smooth_y = None
+
+    def update(self, x, y):
+        if self.smooth_x is None or self.smooth_y is None:
+            self.smooth_x = float(x)
+            self.smooth_y = float(y)
+        else:
+            self.smooth_x = self.alpha * x + (1 - self.alpha) * self.smooth_x
+            self.smooth_y = self.alpha * y + (1 - self.alpha) * self.smooth_y
+        return int(self.smooth_x), int(self.smooth_y)
+
+    def reset(self):
+        self.smooth_x = None
+        self.smooth_y = None
+
+
+# --- Vision Analysis via Local Ollama ---
+def analyze_sketch_with_ollama(image_path):
+    prompt = (
+        "Analyze this canvas drawing. "
+        "If it contains a math formula, output the equation and solve it step-by-step. "
+        "If it is a sketch or diagram, describe what is drawn."
+    )
+    try:
+        with open(image_path, "rb") as img_file:
+            encoded_image = base64.b64encode(img_file.read()).decode("utf-8")
+
+        payload = {
+            "model": CONFIG.get("ollama_model", "llava"),
+            "prompt": prompt,
+            "images": [encoded_image],
+            "stream": False
+        }
+        res = requests.post(
+            CONFIG.get("ollama_url", "http://localhost:11434/api/generate"),
+            json=payload,
+            timeout=30
+        )
+        res.raise_for_status()
+        text = res.json().get("response", "").strip()
+        return text if text else "(No analysis response from model.)"
+    except Exception as e:
+        return f"[Ollama Error: {e}]"
+
+
+# --- Gesture Classifier ---
+def euclidean_dist(p1, p2, w, h):
+    return math.hypot((p1.x - p2.x) * w, (p1.y - p2.y) * h)
+
+
+def classify_gesture(landmarks, w, h):
+    wrist = landmarks[0]
+    middle_mcp = landmarks[9]
+    hand_scale = max(euclidean_dist(wrist, middle_mcp, w, h), 10.0)
+
+    thumb_tip = landmarks[4]
+    index_tip = landmarks[8]
+    index_pip = landmarks[6]
+    middle_tip = landmarks[12]
+    middle_pip = landmarks[10]
+    ring_tip = landmarks[16]
+    ring_pip = landmarks[14]
+    pinky_tip = landmarks[20]
+    pinky_pip = landmarks[18]
+
+    pinch_norm = euclidean_dist(thumb_tip, index_tip, w, h) / hand_scale
+
+    index_up = index_tip.y < index_pip.y
+    middle_up = middle_tip.y < middle_pip.y
+    ring_up = ring_tip.y < ring_pip.y
+    pinky_up = pinky_tip.y < pinky_pip.y
+
+    if pinch_norm < 0.35:
+        return "PINCH"
+    elif index_up and middle_up and not ring_up and not pinky_up:
+        return "SELECTION"
+    elif not index_up and not middle_up and not ring_up and not pinky_up:
+        return "CLEAR"
+    elif index_up and middle_up and ring_up and pinky_up:
+        return "ANALYZE"
+    else:
+        return "HOVER"
+
+
+# --- Canvas Bounding Box Crop ---
+def extract_canvas_crop(canvas):
+    gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    x_min, y_min = canvas.shape[1], canvas.shape[0]
+    x_max, y_max = 0, 0
+
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        x_min = min(x_min, x)
+        y_min = min(y_min, y)
+        x_max = max(x_max, x + w)
+        y_max = max(y_max, y + h)
+
+    pad = 25
+    x_min = max(0, x_min - pad)
+    y_min = max(0, y_min - pad)
+    x_max = min(canvas.shape[1], x_max + pad)
+    y_max = min(canvas.shape[0], y_max + pad)
+
+    crop = canvas[y_min:y_max, x_min:x_max]
+
+    white_bg_crop = np.ones_like(crop) * 255
+    mask = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) > 10
+    white_bg_crop[mask] = crop[mask]
+
+    return white_bg_crop
+
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20)
+]
+
+
+def draw_hand_landmarks(image, landmarks, w, h):
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+    for p1_idx, p2_idx in HAND_CONNECTIONS:
+        cv2.line(image, pts[p1_idx], pts[p2_idx], (0, 255, 0), 2)
+    for pt in pts:
+        cv2.circle(image, pt, 4, (0, 0, 255), -1)
+
+
+# --- Main Loop ---
+def run_air_canvas():
+    download_model_if_missing()
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Webcam not found.")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    ret, sample_frame = cap.read()
+    if not ret:
+        print("Error: Unable to read camera frame.")
+        return
+
+    h, w, _ = sample_frame.shape
+
+    # MediaPipe Tasks Landmarker Setup
+    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.7,
+        min_tracking_confidence=0.7
+    )
+
+    detector = vision.HandLandmarker.create_from_options(options)
+
+    colors = CONFIG.get("brush_colors", DEFAULT_CONFIG["brush_colors"])
+    current_color_idx = 0
+    active_bgr = tuple(colors[current_color_idx]["bgr"])
+
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+
+    smoother = PointSmoother(alpha=0.35)
+    stroke_points = deque(maxlen=6)
+    gesture_buffer = deque(maxlen=3)
+
+    active_gesture = "HOVER"
+    clear_hold_start = None
+    analyze_hold_start = None
+
+    analysis_result_text = ""
+    status_msg = "Pinch thumb & index to draw | 2 fingers to pick color"
+
+    btn_width = w // max(1, len(colors))
+    header_height = 60
+
+    print("==================================================")
+    print("    Air Canvas (Tasks API Edition) Running       ")
+    print("==================================================")
+
+    timestamp_ms = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        timestamp_ms += 33
+        results = detector.detect_for_video(mp_image, timestamp_ms)
+
+        # Draw Toolbar UI
+        for i, col_info in enumerate(colors):
+            bx1, bx2 = i * btn_width, (i + 1) * btn_width
+            color_tuple = tuple(col_info["bgr"])
+            cv2.rectangle(frame, (bx1, 0), (bx2, header_height), color_tuple, -1)
+
+            border_thick = 4 if i == current_color_idx else 1
+            cv2.rectangle(frame, (bx1, 0), (bx2, header_height), (255, 255, 255), border_thick)
+
+            text_col = (255, 255, 255) if sum(color_tuple) < 300 else (0, 0, 0)
+            cv2.putText(frame, col_info["name"], (bx1 + 15, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_col, 2)
+
+        if results.hand_landmarks:
+            landmarks = results.hand_landmarks[0]
+            draw_hand_landmarks(frame, landmarks, w, h)
+
+            raw_x, raw_y = int(landmarks[8].x * w), int(landmarks[8].y * h)
+            raw_gesture = classify_gesture(landmarks, w, h)
+            gesture_buffer.append(raw_gesture)
+
+            if gesture_buffer.count(gesture_buffer[0]) == gesture_buffer.maxlen:
+                active_gesture = gesture_buffer[0]
+
+            if active_gesture == "SELECTION":
+                smoother.reset()
+                stroke_points.clear()
+
+                cv2.circle(frame, (raw_x, raw_y), 10, (255, 255, 255), 2)
+                if raw_y <= header_height:
+                    selected_idx = min(raw_x // btn_width, len(colors) - 1)
+                    if selected_idx != current_color_idx:
+                        current_color_idx = selected_idx
+                        active_bgr = tuple(colors[current_color_idx]["bgr"])
+                        status_msg = f"Selected Tool: {colors[current_color_idx]['name']}"
+
+            elif active_gesture == "PINCH":
+                tx, ty = int(landmarks[4].x * w), int(landmarks[4].y * h)
+                cx, cy = (raw_x + tx) // 2, (raw_y + ty) // 2
+
+                sx, sy = smoother.update(cx, cy)
+                stroke_points.append((sx, sy))
+
+                is_eraser = colors[current_color_idx]["name"].lower() == "eraser"
+                brush_size = CONFIG.get("eraser_size", 45) if is_eraser else CONFIG.get("default_brush_size", 6)
+                draw_color = (0, 0, 0) if is_eraser else active_bgr
+
+                cv2.circle(frame, (sx, sy), brush_size // 2, active_bgr, -1)
+
+                if len(stroke_points) >= 2:
+                    pts = np.array(list(stroke_points), dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(canvas, [pts], False, draw_color, brush_size)
+
+            else:
+                smoother.reset()
+                stroke_points.clear()
+
+            # Fist -> Clear canvas
+            if active_gesture == "CLEAR":
+                if clear_hold_start is None:
+                    clear_hold_start = time.time()
+                elif time.time() - clear_hold_start > 1.2:
+                    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+                    status_msg = "Canvas Cleared!"
+                    analysis_result_text = ""
+                    clear_hold_start = None
+            else:
+                clear_hold_start = None
+
+            # Open Palm -> Analyze sketch
+            if active_gesture == "ANALYZE":
+                if analyze_hold_start is None:
+                    analyze_hold_start = time.time()
+                elif time.time() - analyze_hold_start > 1.2:
+                    analyze_hold_start = None
+                    crop = extract_canvas_crop(canvas)
+                    if crop is not None:
+                        filepath = os.path.join(SKETCH_DIR, f"sketch_{int(time.time())}.png")
+                        cv2.imwrite(filepath, crop)
+                        status_msg = f"Analyzing with {CONFIG.get('ollama_model', 'llava')}..."
+                        cv2.imshow("Air Canvas", frame)
+                        cv2.waitKey(1)
+
+                        analysis_result_text = analyze_sketch_with_ollama(filepath)
+                        status_msg = "Analysis Complete!"
+                    else:
+                        status_msg = "Canvas is empty!"
+            else:
+                analyze_hold_start = None
+
+        else:
+            smoother.reset()
+            stroke_points.clear()
+            gesture_buffer.clear()
+            active_gesture = "HOVER"
+            clear_hold_start = None
+            analyze_hold_start = None
+
+        # Blend drawing canvas with video feed
+        canvas_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+        _, inv_mask = cv2.threshold(canvas_gray, 10, 255, cv2.THRESH_BINARY_INV)
+        inv_mask_bgr = cv2.cvtColor(inv_mask, cv2.COLOR_GRAY2BGR)
+
+        frame_bg = cv2.bitwise_and(frame, inv_mask_bgr)
+        blended_frame = cv2.add(frame_bg, canvas)
+
+        # Status text overlay
+        cv2.rectangle(blended_frame, (0, h - 35), (w, h), (25, 25, 25), -1)
+        cv2.putText(blended_frame, f"State: {active_gesture} | {status_msg}", (10, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+
+        if analysis_result_text:
+            cv2.rectangle(blended_frame, (10, h - 180), (w - 10, h - 45), (0, 0, 0), -1)
+            cv2.rectangle(blended_frame, (10, h - 180), (w - 10, h - 45), (0, 255, 0), 1)
+
+            lines = analysis_result_text.split("\n")
+            y_off = h - 155
+            for line in lines[:5]:
+                cv2.putText(blended_frame, line[:110], (20, y_off),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                y_off += 22
+
+        cv2.imshow("Air Canvas", blended_frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord('q')):
+            break
+        elif key == ord('c'):
+            canvas = np.zeros((h, w, 3), dtype=np.uint8)
+            status_msg = "Canvas cleared!"
+            analysis_result_text = ""
+        elif key == ord('s'):
+            crop = extract_canvas_crop(canvas)
+            target = crop if crop is not None else canvas
+            filepath = os.path.join(SKETCH_DIR, f"sketch_{int(time.time())}.png")
+            cv2.imwrite(filepath, target)
+            status_msg = f"Saved: {filepath}"
+
+    detector.close()
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    run_air_canvas()
