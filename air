@@ -3,9 +3,9 @@ import json
 import time
 import math
 import base64
+import threading
 import urllib.request
 from collections import deque
-from datetime import datetime
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -13,30 +13,37 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import requests
 
-# --- Directory and Path Configuration ---
+# --- Configuration & File Setup ---
 CONFIG_DIR = "config"
 CONFIG_PATH = os.path.join(CONFIG_DIR, "brush_palette.json")
 SKETCH_DIR = os.path.join("canvas", "sketches")
 MODEL_PATH = "hand_landmarker.task"
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 
+# Palette featuring 10 distinct colors
+TEN_COLORS = [
+    {"name": "Blue", "bgr": [255, 0, 0]},
+    {"name": "Green", "bgr": [0, 255, 0]},
+    {"name": "Red", "bgr": [0, 0, 255]},
+    {"name": "Yellow", "bgr": [0, 255, 255]},
+    {"name": "Cyan", "bgr": [255, 255, 0]},
+    {"name": "Magenta", "bgr": [255, 0, 255]},
+    {"name": "Orange", "bgr": [0, 165, 255]},
+    {"name": "Purple", "bgr": [128, 0, 128]},
+    {"name": "White", "bgr": [255, 255, 255]},
+    {"name": "Eraser", "bgr": [0, 0, 0]}
+]
+
 DEFAULT_CONFIG = {
-    "brush_colors": [
-        {"name": "Blue", "bgr": [255, 0, 0]},
-        {"name": "Green", "bgr": [0, 255, 0]},
-        {"name": "Red", "bgr": [0, 0, 255]},
-        {"name": "Yellow", "bgr": [0, 255, 255]},
-        {"name": "Eraser", "bgr": [0, 0, 0]}
-    ],
-    "default_brush_size": 6,
-    "eraser_size": 45,
+    "brush_colors": TEN_COLORS,
+    "min_brush_size": 2,
+    "max_brush_size": 40,
     "ollama_url": "http://localhost:11434/api/generate",
     "ollama_model": "llava"
 }
 
 
 def download_model_if_missing():
-    """Downloads hand_landmarker.task model automatically if not present."""
     if not os.path.exists(MODEL_PATH):
         print("Downloading MediaPipe Hand Landmarker model file (~8.8MB)...")
         try:
@@ -58,7 +65,11 @@ def load_config():
         return DEFAULT_CONFIG
     try:
         with open(CONFIG_PATH, "r") as f:
-            return json.load(f)
+            cfg = json.load(f)
+            # Ensure 10 colors exist in configuration
+            if len(cfg.get("brush_colors", [])) < 10:
+                cfg["brush_colors"] = TEN_COLORS
+            return cfg
     except Exception:
         return DEFAULT_CONFIG
 
@@ -66,9 +77,9 @@ def load_config():
 CONFIG = load_config()
 
 
-# --- Exponential Smoother for Point Tracking ---
+# --- Dynamic Point Smoother ---
 class PointSmoother:
-    def __init__(self, alpha=0.35):
+    def __init__(self, alpha=0.6):
         self.alpha = alpha
         self.smooth_x = None
         self.smooth_y = None
@@ -77,9 +88,10 @@ class PointSmoother:
         if self.smooth_x is None or self.smooth_y is None:
             self.smooth_x = float(x)
             self.smooth_y = float(y)
-        else:
-            self.smooth_x = self.alpha * x + (1 - self.alpha) * self.smooth_x
-            self.smooth_y = self.alpha * y + (1 - self.alpha) * self.smooth_y
+            return int(x), int(y)
+
+        self.smooth_x = self.alpha * x + (1 - self.alpha) * self.smooth_x
+        self.smooth_y = self.alpha * y + (1 - self.alpha) * self.smooth_y
         return int(self.smooth_x), int(self.smooth_y)
 
     def reset(self):
@@ -88,35 +100,38 @@ class PointSmoother:
 
 
 # --- Vision Analysis via Local Ollama ---
-def analyze_sketch_with_ollama(image_path):
-    prompt = (
-        "Analyze this canvas drawing. "
-        "If it contains a math formula, output the equation and solve it step-by-step. "
-        "If it is a sketch or diagram, describe what is drawn."
-    )
-    try:
-        with open(image_path, "rb") as img_file:
-            encoded_image = base64.b64encode(img_file.read()).decode("utf-8")
-
-        payload = {
-            "model": CONFIG.get("ollama_model", "llava"),
-            "prompt": prompt,
-            "images": [encoded_image],
-            "stream": False
-        }
-        res = requests.post(
-            CONFIG.get("ollama_url", "http://localhost:11434/api/generate"),
-            json=payload,
-            timeout=30
+def analyze_sketch_async(image_path, callback):
+    def worker():
+        prompt = (
+            "Analyze this canvas drawing. "
+            "If it contains a math formula, output the equation and solve it step-by-step. "
+            "If it is a sketch or diagram, describe what is drawn."
         )
-        res.raise_for_status()
-        text = res.json().get("response", "").strip()
-        return text if text else "(No analysis response from model.)"
-    except Exception as e:
-        return f"[Ollama Error: {e}]"
+        try:
+            with open(image_path, "rb") as img_file:
+                encoded_image = base64.b64encode(img_file.read()).decode("utf-8")
+
+            payload = {
+                "model": CONFIG.get("ollama_model", "llava"),
+                "prompt": prompt,
+                "images": [encoded_image],
+                "stream": False
+            }
+            res = requests.post(
+                CONFIG.get("ollama_url", "http://localhost:11434/api/generate"),
+                json=payload,
+                timeout=30
+            )
+            res.raise_for_status()
+            text = res.json().get("response", "").strip()
+            callback(text if text else "(No response from model.)")
+        except Exception as e:
+            callback(f"[Ollama Error: {e}]")
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
-# --- Gesture Classifier ---
+# --- Gesture Classification ---
 def euclidean_dist(p1, p2, w, h):
     return math.hypot((p1.x - p2.x) * w, (p1.y - p2.y) * h)
 
@@ -144,7 +159,7 @@ def classify_gesture(landmarks, w, h):
     pinky_up = pinky_tip.y < pinky_pip.y
 
     if pinch_norm < 0.35:
-        return "PINCH"
+        return "DRAW"
     elif index_up and middle_up and not ring_up and not pinky_up:
         return "SELECTION"
     elif not index_up and not middle_up and not ring_up and not pinky_up:
@@ -155,7 +170,45 @@ def classify_gesture(landmarks, w, h):
         return "HOVER"
 
 
-# --- Canvas Bounding Box Crop ---
+# --- Universal Dotted Rendering Routines ---
+def draw_dotted_line(img, pt1, pt2, color, thickness=2, gap=12):
+    dist = math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
+    if dist == 0:
+        cv2.circle(img, pt1, max(1, thickness // 2), color, -1)
+        return
+
+    dots = max(int(dist / gap), 1)
+    for i in range(dots + 1):
+        alpha = i / float(dots)
+        x = int(pt1[0] + alpha * (pt2[0] - pt1[0]))
+        y = int(pt1[1] + alpha * (pt2[1] - pt1[1]))
+        cv2.circle(img, (x, y), max(1, thickness // 2), color, -1)
+
+
+def draw_dotted_rectangle(img, pt1, pt2, color, thickness=2, gap=12):
+    top_left = (min(pt1[0], pt2[0]), min(pt1[1], pt2[1]))
+    top_right = (max(pt1[0], pt2[0]), min(pt1[1], pt2[1]))
+    bottom_left = (min(pt1[0], pt2[0]), max(pt1[1], pt2[1]))
+    bottom_right = (max(pt1[0], pt2[0]), max(pt1[1], pt2[1]))
+
+    draw_dotted_line(img, top_left, top_right, color, thickness, gap)
+    draw_dotted_line(img, top_right, bottom_right, color, thickness, gap)
+    draw_dotted_line(img, bottom_right, bottom_left, color, thickness, gap)
+    draw_dotted_line(img, bottom_left, top_left, color, thickness, gap)
+
+
+def draw_dotted_circle(img, center, radius, color, thickness=2, gap=12):
+    if radius <= 0:
+        return
+    circumference = 2 * math.pi * radius
+    num_dots = max(int(circumference / gap), 8)
+    for i in range(num_dots):
+        angle = (2 * math.pi * i) / num_dots
+        x = int(center[0] + radius * math.cos(angle))
+        y = int(center[1] + radius * math.sin(angle))
+        cv2.circle(img, (x, y), max(1, thickness // 2), color, -1)
+
+
 def extract_canvas_crop(canvas):
     gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
@@ -201,12 +254,12 @@ HAND_CONNECTIONS = [
 def draw_hand_landmarks(image, landmarks, w, h):
     pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
     for p1_idx, p2_idx in HAND_CONNECTIONS:
-        cv2.line(image, pts[p1_idx], pts[p2_idx], (0, 255, 0), 2)
+        cv2.line(image, pts[p1_idx], pts[p2_idx], (0, 255, 0), 1)
     for pt in pts:
-        cv2.circle(image, pt, 4, (0, 0, 255), -1)
+        cv2.circle(image, pt, 3, (0, 0, 255), -1)
 
 
-# --- Main Loop ---
+# --- Main Engine ---
 def run_air_canvas():
     download_model_if_missing()
 
@@ -221,201 +274,409 @@ def run_air_canvas():
     ret, sample_frame = cap.read()
     if not ret:
         print("Error: Unable to read camera frame.")
+        cap.release()
         return
 
     h, w, _ = sample_frame.shape
 
-    # MediaPipe Tasks Landmarker Setup
     base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.HandLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
         num_hands=1,
         min_hand_detection_confidence=0.7,
-        min_tracking_confidence=0.7
+        min_tracking_confidence=0.55
     )
 
     detector = vision.HandLandmarker.create_from_options(options)
 
-    colors = CONFIG.get("brush_colors", DEFAULT_CONFIG["brush_colors"])
+    colors = CONFIG.get("brush_colors", TEN_COLORS)
     current_color_idx = 0
     active_bgr = tuple(colors[current_color_idx]["bgr"])
 
+    draw_modes = ["Freehand", "Line", "Rectangle", "Circle"]
+    current_mode_idx = 0
+
+    line_styles = ["Solid", "Dotted"]
+    current_style_idx = 0
+
     canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
-    smoother = PointSmoother(alpha=0.35)
-    stroke_points = deque(maxlen=6)
-    gesture_buffer = deque(maxlen=3)
+    smoother = PointSmoother(alpha=0.6)
+    last_pt = None
+    gesture_buffer = deque(maxlen=2)
 
     active_gesture = "HOVER"
     clear_hold_start = None
     analyze_hold_start = None
 
+    shape_start_pt = None
+    shape_current_pt = None
+    was_drawing = False
+
+    # --- UI Layout Calculations ---
+    sidebar_w = 75
+    usable_w = w - sidebar_w
+
+    # Slider geometry on right sidebar
+    slider_x1, slider_x2 = w - 65, w - 10
+    slider_y1, slider_y2 = 100, h - 160
+    slider_height = slider_y2 - slider_y1
+
+    # Dedicated Side Clear All Button
+    clear_side_btn_y1, clear_side_btn_y2 = h - 140, h - 70
+
+    min_sz = CONFIG.get("min_brush_size", 2)
+    max_sz = CONFIG.get("max_brush_size", 40)
+    current_brush_size = 10
+
+    # Top Toolbar layout (Row 1: 10 Colors, Row 2: Shapes + Line Style + Clear All)
+    color_header_h = 40
+    mode_header_h = 35
+
+    color_btn_w = usable_w // len(colors)
+
+    # Row 2 division
+    clear_btn_w = 110
+    style_btn_w = 75
+    modes_total_w = usable_w - clear_btn_w - (len(line_styles) * style_btn_w)
+    mode_btn_w = modes_total_w // max(1, len(draw_modes))
+
     analysis_result_text = ""
-    status_msg = "Pinch thumb & index to draw | 2 fingers to pick color"
-
-    btn_width = w // max(1, len(colors))
-    header_height = 60
-
-    print("==================================================")
-    print("    Air Canvas (Tasks API Edition) Running       ")
-    print("==================================================")
+    is_analyzing = False
+    status_msg = "Select color/mode | Pinch to draw | Fist to clear"
 
     timestamp_ms = 0
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+    def on_analysis_complete(result):
+        nonlocal analysis_result_text, status_msg, is_analyzing
+        analysis_result_text = result
+        status_msg = "Analysis Complete!"
+        is_analyzing = False
 
-        frame = cv2.flip(frame, 1)
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        timestamp_ms += 33
-        results = detector.detect_for_video(mp_image, timestamp_ms)
+            frame = cv2.flip(frame, 1)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Draw Toolbar UI
-        for i, col_info in enumerate(colors):
-            bx1, bx2 = i * btn_width, (i + 1) * btn_width
-            color_tuple = tuple(col_info["bgr"])
-            cv2.rectangle(frame, (bx1, 0), (bx2, header_height), color_tuple, -1)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            timestamp_ms += 33
+            results = detector.detect_for_video(mp_image, timestamp_ms)
 
-            border_thick = 4 if i == current_color_idx else 1
-            cv2.rectangle(frame, (bx1, 0), (bx2, header_height), (255, 255, 255), border_thick)
+            # --- Render Row 1: 10 Colors Palette ---
+            for i, col_info in enumerate(colors):
+                bx1, bx2 = i * color_btn_w, (i + 1) * color_btn_w
+                color_tuple = tuple(col_info["bgr"])
+                cv2.rectangle(frame, (bx1, 0), (bx2, color_header_h), color_tuple, -1)
 
-            text_col = (255, 255, 255) if sum(color_tuple) < 300 else (0, 0, 0)
-            cv2.putText(frame, col_info["name"], (bx1 + 15, 38),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_col, 2)
+                border_thick = 4 if i == current_color_idx else 1
+                cv2.rectangle(frame, (bx1, 0), (bx2, color_header_h), (255, 255, 255), border_thick)
 
-        if results.hand_landmarks:
-            landmarks = results.hand_landmarks[0]
-            draw_hand_landmarks(frame, landmarks, w, h)
+                # High contrast text color
+                text_col = (255, 255, 255) if sum(color_tuple) < 320 else (0, 0, 0)
+                cv2.putText(frame, col_info["name"], (bx1 + 4, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, text_col, 2)
 
-            raw_x, raw_y = int(landmarks[8].x * w), int(landmarks[8].y * h)
-            raw_gesture = classify_gesture(landmarks, w, h)
-            gesture_buffer.append(raw_gesture)
+            # --- Render Row 2: Modes ---
+            for i, mode_name in enumerate(draw_modes):
+                mx1, mx2 = i * mode_btn_w, (i + 1) * mode_btn_w
+                my1, my2 = color_header_h, color_header_h + mode_header_h
 
-            if gesture_buffer.count(gesture_buffer[0]) == gesture_buffer.maxlen:
-                active_gesture = gesture_buffer[0]
+                bg_col = (70, 70, 70) if i == current_mode_idx else (30, 30, 30)
+                cv2.rectangle(frame, (mx1, my1), (mx2, my2), bg_col, -1)
 
-            if active_gesture == "SELECTION":
-                smoother.reset()
-                stroke_points.clear()
+                border_thick = 3 if i == current_mode_idx else 1
+                cv2.rectangle(frame, (mx1, my1), (mx2, my2), (200, 200, 200), border_thick)
 
-                cv2.circle(frame, (raw_x, raw_y), 10, (255, 255, 255), 2)
-                if raw_y <= header_height:
-                    selected_idx = min(raw_x // btn_width, len(colors) - 1)
-                    if selected_idx != current_color_idx:
-                        current_color_idx = selected_idx
-                        active_bgr = tuple(colors[current_color_idx]["bgr"])
-                        status_msg = f"Selected Tool: {colors[current_color_idx]['name']}"
+                text_col = (0, 255, 255) if i == current_mode_idx else (220, 220, 220)
+                cv2.putText(frame, mode_name, (mx1 + 6, my1 + 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, text_col, 2)
 
-            elif active_gesture == "PINCH":
-                tx, ty = int(landmarks[4].x * w), int(landmarks[4].y * h)
-                cx, cy = (raw_x + tx) // 2, (raw_y + ty) // 2
+            # --- Render Row 2: Line Styles (Solid / Dotted) ---
+            style_start_x = len(draw_modes) * mode_btn_w
+            for i, style_name in enumerate(line_styles):
+                sx1 = style_start_x + (i * style_btn_w)
+                sx2 = sx1 + style_btn_w
+                sy1, sy2 = color_header_h, color_header_h + mode_header_h
 
-                sx, sy = smoother.update(cx, cy)
-                stroke_points.append((sx, sy))
+                bg_col = (90, 50, 0) if i == current_style_idx else (30, 30, 30)
+                cv2.rectangle(frame, (sx1, sy1), (sx2, sy2), bg_col, -1)
+
+                border_thick = 3 if i == current_style_idx else 1
+                cv2.rectangle(frame, (sx1, sy1), (sx2, sy2), (255, 255, 255), border_thick)
+
+                text_col = (0, 255, 0) if i == current_style_idx else (200, 200, 200)
+                cv2.putText(frame, style_name, (sx1 + 8, sy1 + 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, text_col, 2)
+
+            # --- Render Top Row 2: CLEAR ALL Button ---
+            clear_btn_x1 = style_start_x + (len(line_styles) * style_btn_w)
+            clear_btn_x2 = clear_btn_x1 + clear_btn_w
+            clear_btn_y1, clear_btn_y2 = color_header_h, color_header_h + mode_header_h
+
+            cv2.rectangle(frame, (clear_btn_x1, clear_btn_y1), (clear_btn_x2, clear_btn_y2), (0, 0, 200), -1)
+            cv2.rectangle(frame, (clear_btn_x1, clear_btn_y1), (clear_btn_x2, clear_btn_y2), (255, 255, 255), 2)
+            cv2.putText(frame, "CLEAR ALL", (clear_btn_x1 + 8, clear_btn_y1 + 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 2)
+
+            # --- Render Side Size Slider ---
+            cv2.rectangle(frame, (slider_x1, slider_y1), (slider_x2, slider_y2), (40, 40, 40), -1)
+            cv2.rectangle(frame, (slider_x1, slider_y1), (slider_x2, slider_y2), (200, 200, 200), 2)
+            cv2.putText(frame, "SIZE", (slider_x1 + 4, slider_y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+            norm_val = (current_brush_size - min_sz) / float(max_sz - min_sz)
+            knob_y = int(slider_y2 - (norm_val * slider_height))
+
+            cv2.rectangle(frame, (slider_x1 + 2, knob_y), (slider_x2 - 2, slider_y2 - 2), (0, 255, 255), -1)
+            cv2.circle(frame, (slider_x1 + (slider_x2 - slider_x1) // 2, knob_y), 10, (255, 255, 255), -1)
+            cv2.circle(frame, (slider_x1 + (slider_x2 - slider_x1) // 2, knob_y), 10, (0, 0, 0), 2)
+
+            # --- Render Side CLEAR ALL Button ---
+            cv2.rectangle(frame, (slider_x1 - 5, clear_side_btn_y1), (slider_x2 + 5, clear_side_btn_y2), (0, 0, 200), -1)
+            cv2.rectangle(frame, (slider_x1 - 5, clear_side_btn_y1), (slider_x2 + 5, clear_side_btn_y2), (255, 255, 255), 2)
+            cv2.putText(frame, "CLEAR", (slider_x1 - 2, clear_side_btn_y1 + 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 2)
+            cv2.putText(frame, "ALL", (slider_x1 + 8, clear_side_btn_y1 + 52),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 2)
+
+            if results.hand_landmarks:
+                landmarks = results.hand_landmarks[0]
+                draw_hand_landmarks(frame, landmarks, w, h)
+
+                raw_x, raw_y = int(landmarks[8].x * w), int(landmarks[8].y * h)
+                raw_gesture = classify_gesture(landmarks, w, h)
+                gesture_buffer.append(raw_gesture)
+
+                if gesture_buffer.count(gesture_buffer[0]) == gesture_buffer.maxlen:
+                    active_gesture = gesture_buffer[0]
 
                 is_eraser = colors[current_color_idx]["name"].lower() == "eraser"
-                brush_size = CONFIG.get("eraser_size", 45) if is_eraser else CONFIG.get("default_brush_size", 6)
-                draw_color = (0, 0, 0) if is_eraser else active_bgr
+                is_dotted = line_styles[current_style_idx] == "Dotted"
 
-                cv2.circle(frame, (sx, sy), brush_size // 2, active_bgr, -1)
+                # --- SELECTION MODE ---
+                if active_gesture == "SELECTION":
+                    smoother.reset()
+                    last_pt = None
+                    shape_start_pt = None
+                    was_drawing = False
 
-                if len(stroke_points) >= 2:
-                    pts = np.array(list(stroke_points), dtype=np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(canvas, [pts], False, draw_color, brush_size)
+                    cv2.circle(frame, (raw_x, raw_y), 8, (0, 255, 255), 2)
+
+                    # 1. Row 1: 10 Colors Palette
+                    if raw_y <= color_header_h and raw_x < usable_w:
+                        selected_idx = min(raw_x // color_btn_w, len(colors) - 1)
+                        if selected_idx != current_color_idx:
+                            current_color_idx = selected_idx
+                            active_bgr = tuple(colors[current_color_idx]["bgr"])
+                            status_msg = f"Color: {colors[current_color_idx]['name']}"
+
+                    # 2. Row 2: Shapes
+                    elif color_header_h < raw_y <= (color_header_h + mode_header_h) and raw_x < style_start_x:
+                        selected_mode_idx = min(raw_x // mode_btn_w, len(draw_modes) - 1)
+                        if selected_mode_idx != current_mode_idx:
+                            current_mode_idx = selected_mode_idx
+                            status_msg = f"Mode: {draw_modes[current_mode_idx]}"
+
+                    # 3. Row 2: Solid / Dotted Toggles
+                    elif color_header_h < raw_y <= (color_header_h + mode_header_h) and style_start_x <= raw_x < clear_btn_x1:
+                        selected_style_idx = min((raw_x - style_start_x) // style_btn_w, len(line_styles) - 1)
+                        if selected_style_idx != current_style_idx:
+                            current_style_idx = selected_style_idx
+                            status_msg = f"Style: {line_styles[current_style_idx]}"
+
+                    # 4. Top Clear All Button
+                    elif color_header_h < raw_y <= (color_header_h + mode_header_h) and clear_btn_x1 <= raw_x <= clear_btn_x2:
+                        canvas = np.zeros((h, w, 3), dtype=np.uint8)
+                        status_msg = "Canvas Cleared!"
+                        analysis_result_text = ""
+
+                    # 5. Side Clear All Button
+                    elif slider_x1 - 5 <= raw_x <= slider_x2 + 5 and clear_side_btn_y1 <= raw_y <= clear_side_btn_y2:
+                        canvas = np.zeros((h, w, 3), dtype=np.uint8)
+                        status_msg = "Canvas Cleared via Side Button!"
+                        analysis_result_text = ""
+
+                    # 6. Side Size Slider
+                    elif raw_x >= (slider_x1 - 15) and slider_y1 <= raw_y <= slider_y2:
+                        clamped_y = max(slider_y1, min(slider_y2, raw_y))
+                        rel_y = slider_y2 - clamped_y
+                        norm_factor = rel_y / float(slider_height)
+                        current_brush_size = int(min_sz + norm_factor * (max_sz - min_sz))
+                        status_msg = f"Size: {current_brush_size}px"
+
+                # --- DRAWING / PINCH MODE ---
+                elif active_gesture == "DRAW":
+                    tx, ty = int(landmarks[4].x * w), int(landmarks[4].y * h)
+                    cx, cy = (raw_x + tx) // 2, (raw_y + ty) // 2
+
+                    sx, sy = smoother.update(cx, cy)
+                    draw_color = (0, 0, 0) if is_eraser else active_bgr
+                    current_mode = draw_modes[current_mode_idx]
+
+                    if current_mode == "Freehand":
+                        if is_eraser:
+                            cv2.circle(canvas, (sx, sy), current_brush_size * 2, (0, 0, 0), -1)
+                        else:
+                            if last_pt is not None:
+                                if is_dotted:
+                                    draw_dotted_line(canvas, last_pt, (sx, sy), draw_color, current_brush_size, gap=current_brush_size * 2 + 4)
+                                else:
+                                    cv2.line(canvas, last_pt, (sx, sy), draw_color, current_brush_size)
+                            last_pt = (sx, sy)
+
+                    else:
+                        if not was_drawing or shape_start_pt is None:
+                            shape_start_pt = (sx, sy)
+
+                        shape_current_pt = (sx, sy)
+                        was_drawing = True
+
+                    indicator_col = (100, 100, 100) if is_eraser else active_bgr
+                    cv2.circle(frame, (sx, sy), max(2, current_brush_size // 2), indicator_col, -1)
+
+                # --- HOVER / RELEASE MODE ---
+                else:
+                    if was_drawing and shape_start_pt is not None and shape_current_pt is not None:
+                        current_mode = draw_modes[current_mode_idx]
+                        draw_color = (0, 0, 0) if is_eraser else active_bgr
+
+                        if current_mode == "Line":
+                            if is_dotted:
+                                draw_dotted_line(canvas, shape_start_pt, shape_current_pt, draw_color, current_brush_size, gap=current_brush_size * 2 + 4)
+                            else:
+                                cv2.line(canvas, shape_start_pt, shape_current_pt, draw_color, current_brush_size)
+                        elif current_mode == "Rectangle":
+                            if is_dotted:
+                                draw_dotted_rectangle(canvas, shape_start_pt, shape_current_pt, draw_color, current_brush_size, gap=current_brush_size * 2 + 4)
+                            else:
+                                cv2.rectangle(canvas, shape_start_pt, shape_current_pt, draw_color, current_brush_size)
+                        elif current_mode == "Circle":
+                            radius = int(math.hypot(shape_current_pt[0] - shape_start_pt[0], shape_current_pt[1] - shape_start_pt[1]))
+                            if is_dotted:
+                                draw_dotted_circle(canvas, shape_start_pt, radius, draw_color, current_brush_size, gap=current_brush_size * 2 + 4)
+                            else:
+                                cv2.circle(canvas, shape_start_pt, radius, draw_color, current_brush_size)
+
+                    smoother.reset()
+                    last_pt = None
+                    shape_start_pt = None
+                    shape_current_pt = None
+                    was_drawing = False
+
+                # --- CLEAR GESTURE (FIST HOLD) ---
+                if active_gesture == "CLEAR":
+                    if clear_hold_start is None:
+                        clear_hold_start = time.time()
+                    elif time.time() - clear_hold_start > 1.0:
+                        canvas = np.zeros((h, w, 3), dtype=np.uint8)
+                        status_msg = "Canvas Cleared via Fist!"
+                        analysis_result_text = ""
+                        clear_hold_start = None
+                else:
+                    clear_hold_start = None
+
+                # --- ANALYZE GESTURE (OPEN PALM HOLD) ---
+                if active_gesture == "ANALYZE" and not is_analyzing:
+                    if analyze_hold_start is None:
+                        analyze_hold_start = time.time()
+                    elif time.time() - analyze_hold_start > 1.2:
+                        analyze_hold_start = None
+                        crop = extract_canvas_crop(canvas)
+                        if crop is not None:
+                            filepath = os.path.join(SKETCH_DIR, f"sketch_{int(time.time())}.png")
+                            cv2.imwrite(filepath, crop)
+                            status_msg = f"Analyzing with {CONFIG.get('ollama_model', 'llava')}..."
+                            is_analyzing = True
+                            analyze_sketch_async(filepath, on_analysis_complete)
+                        else:
+                            status_msg = "Canvas is empty!"
+                else:
+                    analyze_hold_start = None
 
             else:
                 smoother.reset()
-                stroke_points.clear()
-
-            # Fist -> Clear canvas
-            if active_gesture == "CLEAR":
-                if clear_hold_start is None:
-                    clear_hold_start = time.time()
-                elif time.time() - clear_hold_start > 1.2:
-                    canvas = np.zeros((h, w, 3), dtype=np.uint8)
-                    status_msg = "Canvas Cleared!"
-                    analysis_result_text = ""
-                    clear_hold_start = None
-            else:
+                last_pt = None
+                gesture_buffer.clear()
+                active_gesture = "HOVER"
                 clear_hold_start = None
-
-            # Open Palm -> Analyze sketch
-            if active_gesture == "ANALYZE":
-                if analyze_hold_start is None:
-                    analyze_hold_start = time.time()
-                elif time.time() - analyze_hold_start > 1.2:
-                    analyze_hold_start = None
-                    crop = extract_canvas_crop(canvas)
-                    if crop is not None:
-                        filepath = os.path.join(SKETCH_DIR, f"sketch_{int(time.time())}.png")
-                        cv2.imwrite(filepath, crop)
-                        status_msg = f"Analyzing with {CONFIG.get('ollama_model', 'llava')}..."
-                        cv2.imshow("Air Canvas", frame)
-                        cv2.waitKey(1)
-
-                        analysis_result_text = analyze_sketch_with_ollama(filepath)
-                        status_msg = "Analysis Complete!"
-                    else:
-                        status_msg = "Canvas is empty!"
-            else:
                 analyze_hold_start = None
+                shape_start_pt = None
+                was_drawing = False
 
-        else:
-            smoother.reset()
-            stroke_points.clear()
-            gesture_buffer.clear()
-            active_gesture = "HOVER"
-            clear_hold_start = None
-            analyze_hold_start = None
+            # --- Blend Canvas with Live Video Frame ---
+            canvas_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+            _, inv_mask = cv2.threshold(canvas_gray, 10, 255, cv2.THRESH_BINARY_INV)
+            inv_mask_bgr = cv2.cvtColor(inv_mask, cv2.COLOR_GRAY2BGR)
 
-        # Blend drawing canvas with video feed
-        canvas_gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
-        _, inv_mask = cv2.threshold(canvas_gray, 10, 255, cv2.THRESH_BINARY_INV)
-        inv_mask_bgr = cv2.cvtColor(inv_mask, cv2.COLOR_GRAY2BGR)
+            frame_bg = cv2.bitwise_and(frame, inv_mask_bgr)
+            blended_frame = cv2.add(frame_bg, canvas)
 
-        frame_bg = cv2.bitwise_and(frame, inv_mask_bgr)
-        blended_frame = cv2.add(frame_bg, canvas)
+            # --- Dynamic Shape Preview ---
+            if was_drawing and shape_start_pt is not None and shape_current_pt is not None:
+                current_mode = draw_modes[current_mode_idx]
+                is_eraser = colors[current_color_idx]["name"].lower() == "eraser"
+                preview_color = (150, 150, 150) if is_eraser else active_bgr
+                is_dotted = line_styles[current_style_idx] == "Dotted"
 
-        # Status text overlay
-        cv2.rectangle(blended_frame, (0, h - 35), (w, h), (25, 25, 25), -1)
-        cv2.putText(blended_frame, f"State: {active_gesture} | {status_msg}", (10, h - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+                if current_mode == "Line":
+                    if is_dotted:
+                        draw_dotted_line(blended_frame, shape_start_pt, shape_current_pt, preview_color, current_brush_size, gap=current_brush_size * 2 + 4)
+                    else:
+                        cv2.line(blended_frame, shape_start_pt, shape_current_pt, preview_color, current_brush_size)
+                elif current_mode == "Rectangle":
+                    if is_dotted:
+                        draw_dotted_rectangle(blended_frame, shape_start_pt, shape_current_pt, preview_color, current_brush_size, gap=current_brush_size * 2 + 4)
+                    else:
+                        cv2.rectangle(blended_frame, shape_start_pt, shape_current_pt, preview_color, current_brush_size)
+                elif current_mode == "Circle":
+                    radius = int(math.hypot(shape_current_pt[0] - shape_start_pt[0], shape_current_pt[1] - shape_start_pt[1]))
+                    if is_dotted:
+                        draw_dotted_circle(blended_frame, shape_start_pt, radius, preview_color, current_brush_size, gap=current_brush_size * 2 + 4)
+                    else:
+                        cv2.circle(blended_frame, shape_start_pt, radius, preview_color, current_brush_size)
 
-        if analysis_result_text:
-            cv2.rectangle(blended_frame, (10, h - 180), (w - 10, h - 45), (0, 0, 0), -1)
-            cv2.rectangle(blended_frame, (10, h - 180), (w - 10, h - 45), (0, 255, 0), 1)
+            # --- Status Footer Overlay ---
+            cv2.rectangle(blended_frame, (0, h - 35), (w, h), (20, 20, 20), -1)
+            cv2.putText(blended_frame, f"State: {active_gesture} | Mode: {draw_modes[current_mode_idx]} | Style: {line_styles[current_style_idx]} | Size: {current_brush_size}px | {status_msg}",
+                        (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
-            lines = analysis_result_text.split("\n")
-            y_off = h - 155
-            for line in lines[:5]:
-                cv2.putText(blended_frame, line[:110], (20, y_off),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-                y_off += 22
+            # --- Ollama Output Window ---
+            if analysis_result_text:
+                cv2.rectangle(blended_frame, (10, h - 180), (w - 10, h - 45), (0, 0, 0), -1)
+                cv2.rectangle(blended_frame, (10, h - 180), (w - 10, h - 45), (0, 255, 0), 1)
 
-        cv2.imshow("Air Canvas", blended_frame)
+                lines = analysis_result_text.split("\n")
+                y_off = h - 155
+                for line in lines[:5]:
+                    cv2.putText(blended_frame, line[:110], (20, y_off),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                    y_off += 22
 
-        key = cv2.waitKey(1) & 0xFF
-        if key in (27, ord('q')):
-            break
-        elif key == ord('c'):
-            canvas = np.zeros((h, w, 3), dtype=np.uint8)
-            status_msg = "Canvas cleared!"
-            analysis_result_text = ""
-        elif key == ord('s'):
-            crop = extract_canvas_crop(canvas)
-            target = crop if crop is not None else canvas
-            filepath = os.path.join(SKETCH_DIR, f"sketch_{int(time.time())}.png")
-            cv2.imwrite(filepath, target)
-            status_msg = f"Saved: {filepath}"
+            cv2.imshow("Air Canvas", blended_frame)
 
-    detector.close()
-    cap.release()
-    cv2.destroyAllWindows()
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord('q')):
+                break
+            elif key == ord('c'):
+                canvas = np.zeros((h, w, 3), dtype=np.uint8)
+                status_msg = "Canvas cleared!"
+                analysis_result_text = ""
+            elif key == ord('s'):
+                crop = extract_canvas_crop(canvas)
+                target = crop if crop is not None else canvas
+                filepath = os.path.join(SKETCH_DIR, f"sketch_{int(time.time())}.png")
+                cv2.imwrite(filepath, target)
+                status_msg = f"Saved: {filepath}"
+
+    finally:
+        detector.close()
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
